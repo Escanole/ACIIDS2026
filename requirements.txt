@@ -1,0 +1,11 @@
+torch>=1.9.0
+torchvision>=0.10.0
+torchxrayvision
+pandas
+numpy
+scikit-learn
+opencv-python
+matplotlib
+tqdm
+Pillow
+pyyaml

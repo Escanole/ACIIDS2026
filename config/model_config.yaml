@@ -1,0 +1,40 @@
+model:
+  architecture: "DANN_DenseNet121"
+  num_classes: 13  # Excluding support devices for task classification
+  domain_classes: 1  # Binary domain classification
+  freeze_backbone: true
+
+training:
+  batch_size: 64
+  max_epochs: 15
+  learning_rate: 0.0001
+  weight_decay: 1e-5
+  
+data:
+  image_size: 224
+  resize: [320, 320]
+  policy: "ones"
+
+paths:
+  train_csv: "C:/causal_xray/chexpert/train.csv"
+  valid_csv: "C:/causal_xray/chexpert/valid.csv"
+  test_csv: "C:/causal_xray/chexpert/test_labels.csv"
+  train_base: "C:/causal_xray/chexpert"
+  valid_base: "C:/causal_xray/chexpert"
+  test_base: "C:/causal_xray/chexpert"
+
+class_names:
+  - "No Finding"
+  - "Enlarged Cardiomediastinum"
+  - "Cardiomegaly"
+  - "Lung Opacity"
+  - "Lung Lesion"
+  - "Edema"
+  - "Consolidation"
+  - "Pneumonia"
+  - "Atelectasis"
+  - "Pneumothorax"
+  - "Pleural Effusion"
+  - "Pleural Other"
+  - "Fracture"
+  - "Support Devices"
