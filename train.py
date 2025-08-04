@@ -36,7 +36,7 @@ def load_config(config_path='config/model_config.yaml'):
 def create_transforms(config):
     normalize = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     transform_list = [
-        transforms.RandomResizedCrop(config['data']['image_size']),
+        transforms.Resize(config['data']['resize']),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         normalize

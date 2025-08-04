@@ -12,7 +12,7 @@ training:
   
 data:
   image_size: 224
-  resize: [320, 320]
+  resize: [224, 224]
   policy: "ones"
 
 paths:
