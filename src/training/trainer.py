@@ -41,7 +41,7 @@ class CheXpertTrainer:
         
         if checkpoint is not None:
             print(f"[INFO] Resuming from checkpoint: {checkpoint}")
-            modelCheckpoint = torch.load(checkpoint)
+            modelCheckpoint = torch.load(checkpoint, weights_only=False)
             self.model.load_state_dict(modelCheckpoint['state_dict'])
             self.F_optimizer.load_state_dict(modelCheckpoint.get('F_optimizer', {}))
             self.C_optimizer.load_state_dict(modelCheckpoint.get('C_optimizer', {}))
@@ -141,10 +141,10 @@ class CheXpertTrainer:
 
     def _train_epoch(self, dataLoader, dataLoaderVal, lambda_, trMaxEpoch, nnClassCount, epochID):
         self.model.train()
-        
-        total_losses = []
-        task_losses = []
-        domain_losses = []
+
+        batchs = []
+        losstrain_total, losstrain_task, losstrain_domain = [], [], []
+        losseval = []
         
         progress = tqdm(enumerate(dataLoader), total=len(dataLoader), desc="Training")
         for batchID, (images, task_labels, domain_labels, _) in progress:
@@ -195,25 +195,30 @@ class CheXpertTrainer:
                 self.C_optimizer.step()
             else:
                 print("[WARNING] NaN gradients detected, skipping step")
-            
+
             # Track losses
-            total_losses.append(total_loss.item())
-            task_losses.append(task_loss.item())
-            domain_losses.append(domain_loss.item())
-            
+            losstrain_total.append(total_loss.item())
+            losstrain_task.append(task_loss.item())
+            losstrain_domain.append(domain_loss.item())
+
             # Update progress
             if batchID % 35 == 0:
+                batchs.append(batchID)
+                val_loss, _, _ = self._validate_epoch(dataLoaderVal)
+                losseval.append(val_loss)
                 progress.set_postfix({
-                    'Total': f"{total_loss.item():.4f}",
-                    'Task': f"{task_loss.item():.4f}",
-                    'Domain': f"{domain_loss.item():.4f}"
+                    'Total Loss': f"{total_loss.item():.4f}",
+                    'Task Loss': f"{task_loss.item():.4f}",
+                    'Domain Loss': f"{domain_loss.item():.4f}",
+                    'Domain Adv': f"{domain_loss_adv.item():.4f}",
+                    'Val Loss': f"{val_loss:.4f}"
                 })
         
-        return np.mean(total_losses), np.mean(task_losses), np.mean(domain_losses)
+        return (np.mean(losstrain_total), np.mean(losstrain_task), np.mean(losstrain_domain),)
 
     def _validate_epoch(self, dataLoader):
         self.model.eval()
-        total_loss = 0
+        lossVal, lossValNorm = 0, 0
         y_true = []
         y_pred = []
         
@@ -224,9 +229,10 @@ class CheXpertTrainer:
                 
                 features = self.model(images)
                 task_output = self.model.module.get_task_predictions(features)
-                
-                loss = self.loss_task(task_output, task_labels)
-                total_loss += loss.item()
+
+                losstensor = self.loss_task(task_output, task_labels)
+                lossVal += losstensor.item()
+                lossValNorm += 1
                 
                 y_true.append(task_labels.cpu())
                 y_pred.append(torch.sigmoid(task_output).cpu())
@@ -234,7 +240,7 @@ class CheXpertTrainer:
         y_true = torch.cat(y_true, 0)
         y_pred = torch.cat(y_pred, 0)
         
-        return total_loss / len(dataLoader), y_true, y_pred
+        return lossVal / lossValNorm, y_true, y_pred
 
     def _compute_auroc(self, dataGT, dataPRED, classCount):
         scores = []
@@ -255,7 +261,7 @@ class CheXpertTrainer:
 
     def test(self, dataLoaderTest, nnClassCount, checkpoint, class_names):
         if checkpoint is not None:
-            modelCheckpoint = torch.load(checkpoint)
+            modelCheckpoint = torch.load(checkpoint, weights_only=False)
             self.model.load_state_dict(modelCheckpoint['state_dict'])
         
         self.model.eval()

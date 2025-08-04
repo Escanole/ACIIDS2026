@@ -223,10 +223,10 @@ def main():
             plot_results(total_losses, task_losses, domain_losses, val_losses, f1s, aucs)
             
             # Optional: Test the model
-            print("\n🧪 Testing model...")
-            trainer.test(test_loader, config['model']['num_classes'], 
-                        f"models/checkpoints/best_auc/best_auc_epoch{len(aucs)-1}_{timestamp}.pth.tar", 
-                        config['class_names'])
+            # print("\n🧪 Testing model...")
+            # trainer.test(test_loader, config['model']['num_classes'],
+            #             f"models/checkpoints/best_auc/best_auc_epoch{len(aucs)-1}_{timestamp}.pth.tar",
+            #             config['class_names'])
             
         except KeyboardInterrupt:
             print("\n⚠️ Training interrupted by user")
