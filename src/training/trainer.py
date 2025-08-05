@@ -4,6 +4,7 @@ import torch.optim as optim
 import numpy as np
 import time
 import os
+import logging
 from tqdm import tqdm
 from sklearn.metrics import f1_score, roc_auc_score
 from torch.optim.lr_scheduler import LambdaLR
@@ -17,6 +18,18 @@ class CheXpertTrainer:
     def __init__(self, model, config):
         self.model = model
         self.config = config
+
+        # Set up logger
+        self.logger = logging.getLogger(self.__class__.__name__)
+        if not self.logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter(
+                '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            )
+            handler.setFormatter(formatter)
+            self.logger.addHandler(handler)
+            self.logger.setLevel(logging.INFO)
         
         # Separate optimizers for DANN
         feature_params = list(model.module.features.parameters())
@@ -38,9 +51,20 @@ class CheXpertTrainer:
         start_epoch = 0
         lossMIN = float('inf')
         aucMAX = float('-inf')
-        
+
+        epoch_total_losses = []
+        epoch_task_losses = []
+        epoch_domain_losses = []
+        val_losses = []
+        f1s = []
+        aucs = []
+
+        # === Epoch control logic ===
+        total_epochs = trMaxEpoch  # used for correct lambda schedule
+        run_epochs = trMaxEpoch  # default to full training
+
         if checkpoint is not None:
-            print(f"[INFO] Resuming from checkpoint: {checkpoint}")
+            self.logger.info(f"Resuming from checkpoint: {checkpoint}")
             modelCheckpoint = torch.load(checkpoint, weights_only=False)
             self.model.load_state_dict(modelCheckpoint['state_dict'])
             self.F_optimizer.load_state_dict(modelCheckpoint.get('F_optimizer', {}))
@@ -49,55 +73,69 @@ class CheXpertTrainer:
             start_epoch = modelCheckpoint.get('epoch', 0)
             lossMIN = modelCheckpoint.get('val_loss', float('inf'))
             aucMAX = modelCheckpoint.get('mean_auc', float('-inf'))
-        
-        total_epochs = start_epoch + trMaxEpoch
-        
+
+            # Calculate remaining epochs and limit to 15 per session
+            remaining_epochs = max(0, trMaxEpoch - start_epoch)
+            run_epochs = min(15, remaining_epochs)
+
+            if remaining_epochs <= 0:
+                self.logger.info(f"Training already completed! Current epoch {start_epoch} >= target {trMaxEpoch}")
+                return epoch_total_losses, epoch_task_losses, epoch_domain_losses, val_losses, f1s, aucs
+            elif remaining_epochs <= 15:
+                self.logger.info(f"Continuing training for {remaining_epochs} final epochs (to reach {trMaxEpoch})")
+            else:
+                self.logger.info(
+                    f"Continuing training for 15 more epochs ({remaining_epochs} remaining to reach {trMaxEpoch})")
+
+        else:
+            # Fresh training - limit to 15 epochs per session
+            run_epochs = min(15, trMaxEpoch)
+            if trMaxEpoch > 15:
+                self.logger.info(f"No checkpoint. Requested {trMaxEpoch} epochs, running first 15 epochs.")
+            else:
+                self.logger.info(f"No checkpoint. Running {trMaxEpoch} epochs.")
+
         # Learning rate schedulers
-        lr_lambda = lambda epoch: 1 / (1 + 5 * (epoch / total_epochs))**0.5
+        lr_lambda = lambda epoch: 1 / (1 + 5 * (epoch / run_epochs)) ** 0.5
         F_scheduler = LambdaLR(self.F_optimizer, lr_lambda)
         C_scheduler = LambdaLR(self.C_optimizer, lr_lambda)
         D_scheduler = LambdaLR(self.D_optimizer, lr_lambda)
-        
-        epoch_total_losses = []
-        epoch_task_losses = []
-        epoch_domain_losses = []
-        val_losses = []
-        f1s = []
-        aucs = []
-        
-        for epochID in range(trMaxEpoch):
-            global_epoch = start_epoch + epochID
-            p = global_epoch / total_epochs
+
+        for epochID in range(run_epochs):
+            current_epoch = start_epoch + epochID
+            p = current_epoch / total_epochs
             lambda_ = 0.1 * (2. / (1 + np.exp(-10. * p)) - 1.)
-            
-            print(f"[INFO] Epoch {global_epoch+1}/{total_epochs} | λ: {lambda_:.3f} | LR: {self.F_optimizer.param_groups[0]['lr']:.6f}")
-            
+
+            self.logger.info(
+                f"Epoch {current_epoch + 1}/{total_epochs} | λ: {lambda_:.3f} | LR: {self.F_optimizer.param_groups[0]['lr']:.6f}")
+
             # Unfreeze backbone at epoch 3
-            if global_epoch == 3:
-                print("[INFO] Unfreezing backbone (DenseNet121 features) with reduced LR")
+            if current_epoch == 3:
+                self.logger.info("Unfreezing backbone (DenseNet121 features) with reduced LR")
                 for param in self.model.module.features.parameters():
                     param.requires_grad = True
                 for param_group in self.F_optimizer.param_groups:
                     param_group['lr'] = 1e-5
-                    
+
                 def freeze_bn(module):
                     if isinstance(module, nn.BatchNorm2d):
                         module.eval()
                         module.track_running_stats = False
+
                 self.model.module.features.apply(freeze_bn)
-            
+
             # Train epoch
             total_loss, task_loss, domain_loss = self._train_epoch(
-                dataLoaderTrain, dataLoaderVal, lambda_, total_epochs, 
-                self.config['model']['num_classes'], global_epoch
+                dataLoaderTrain, dataLoaderVal, lambda_, total_epochs,
+                self.config['model']['num_classes'], current_epoch
             )
-            
+
             # Validation epoch
             val_loss, y_true, y_pred = self._validate_epoch(dataLoaderVal)
             auroc = self._compute_auroc(y_true, y_pred, self.config['model']['num_classes'])
             f1 = self._compute_f1(y_true, y_pred)
             mean_auc = np.nanmean(auroc)
-            
+
             # Store metrics
             epoch_total_losses.append(total_loss)
             epoch_task_losses.append(task_loss)
@@ -105,10 +143,10 @@ class CheXpertTrainer:
             val_losses.append(val_loss)
             f1s.append(f1)
             aucs.append(auroc)
-            
+
             # Save checkpoints
             checkpoint_state = {
-                'epoch': global_epoch + 1,
+                'epoch': current_epoch + 1,
                 'state_dict': self.model.state_dict(),
                 'F_optimizer': self.F_optimizer.state_dict(),
                 'C_optimizer': self.C_optimizer.state_dict(),
@@ -116,27 +154,29 @@ class CheXpertTrainer:
                 'val_loss': val_loss,
                 'mean_auc': mean_auc
             }
-            
+
             if val_loss < lossMIN:
                 lossMIN = val_loss
-                save_checkpoint(checkpoint_state, "models/checkpoints/best_loss", 
-                              f"best_loss_epoch{global_epoch}_{launchTimestamp}.pth.tar")
-                print(f"[SAVE] Epoch {global_epoch+1} | 🟢 New best val loss: {val_loss:.4f}")
-            
+                save_checkpoint(checkpoint_state, "models/checkpoints/best_loss",
+                                f"best_loss_epoch{current_epoch}_{launchTimestamp}.pth.tar")
+                self.logger.info(f"SAVE - Epoch {current_epoch + 1} | 🟢 New best val loss: {val_loss:.4f}")
+
             if mean_auc > aucMAX:
                 aucMAX = mean_auc
-                save_checkpoint(checkpoint_state, "models/checkpoints/best_auc", 
-                              f"best_auc_epoch{global_epoch}_{launchTimestamp}.pth.tar")
-                print(f"[SAVE] Epoch {global_epoch+1} | 🔵 New best AUC: {mean_auc:.4f}")
-            
-            save_checkpoint(checkpoint_state, "models/checkpoints/last", 
-                          f"last_epoch{global_epoch}_{launchTimestamp}.pth.tar")
-            
+                save_checkpoint(checkpoint_state, "models/checkpoints/best_auc",
+                                f"best_auc_epoch{current_epoch}_{launchTimestamp}.pth.tar")
+                self.logger.info(f"SAVE - Epoch {current_epoch + 1} | 🔵 New best AUC: {mean_auc:.4f}")
+
+            save_checkpoint(checkpoint_state, "models/checkpoints/last",
+                            f"last_epoch{current_epoch}_{launchTimestamp}.pth.tar")
+            self.logger.info(
+                f"SAVE - Epoch {current_epoch + 1} | 💾 Saved last checkpoint | Val Loss = {val_loss:.4f} | AUC Score = {mean_auc:.4f} | F1 Score = {f1:.4f}")
+
             # Update schedulers
             F_scheduler.step()
             C_scheduler.step()
             D_scheduler.step()
-        
+
         return epoch_total_losses, epoch_task_losses, epoch_domain_losses, val_losses, f1s, aucs
 
     def _train_epoch(self, dataLoader, dataLoaderVal, lambda_, trMaxEpoch, nnClassCount, epochID):
@@ -145,25 +185,25 @@ class CheXpertTrainer:
         batchs = []
         losstrain_total, losstrain_task, losstrain_domain = [], [], []
         losseval = []
-        
+
         progress = tqdm(enumerate(dataLoader), total=len(dataLoader), desc="Training")
         for batchID, (images, task_labels, domain_labels, _) in progress:
             images = images.cuda()
             task_labels = task_labels.float().view(-1, nnClassCount).cuda(non_blocking=True)
             domain_labels = domain_labels.float().view(-1, 1).cuda(non_blocking=True)
-            
+
             # Step 1: Train Domain Discriminator
             features = self.model(images).detach()
             domain_preds = self.model.module.get_domain_predictions(features)
             domain_loss = self.loss_domain(domain_preds, domain_labels)
-            
+
             self.D_optimizer.zero_grad()
             domain_loss.backward()
             self.D_optimizer.step()
-            
+
             # Step 2: Train Feature Extractor + Task Classifier
             features = self.model(images)
-            
+
             # Task loss (only on source domain - no support device)
             source_mask = (domain_labels.squeeze() == 0)
             if source_mask.sum() > 0:
@@ -171,30 +211,30 @@ class CheXpertTrainer:
                 task_loss = self.loss_task(task_preds, task_labels[source_mask])
             else:
                 task_loss = torch.tensor(0.0, requires_grad=True).cuda()
-            
+
             # Domain loss for adversarial training
             domain_preds = self.model.module.get_domain_predictions(features)
             domain_loss_adv = self.loss_domain(domain_preds, domain_labels)
-            
+
             # Combined loss
             total_loss = task_loss - lambda_ * domain_loss_adv
-            
+
             self.F_optimizer.zero_grad()
             self.C_optimizer.zero_grad()
             total_loss.backward()
-            
+
             # Check for NaN gradients
             has_nan = False
             for param in self.model.parameters():
                 if param.grad is not None and torch.isnan(param.grad).any():
                     has_nan = True
                     break
-            
+
             if not has_nan:
                 self.F_optimizer.step()
                 self.C_optimizer.step()
             else:
-                print("[WARNING] NaN gradients detected, skipping step")
+                self.logger.warning("NaN gradients detected, skipping step")
 
             # Track losses
             losstrain_total.append(total_loss.item())
@@ -213,7 +253,7 @@ class CheXpertTrainer:
                     'Domain Adv': f"{domain_loss_adv.item():.4f}",
                     'Val Loss': f"{val_loss:.4f}"
                 })
-        
+
         return (np.mean(losstrain_total), np.mean(losstrain_task), np.mean(losstrain_domain),)
 
     def _validate_epoch(self, dataLoader):
@@ -221,38 +261,38 @@ class CheXpertTrainer:
         lossVal, lossValNorm = 0, 0
         y_true = []
         y_pred = []
-        
+
         with torch.no_grad():
             for images, task_labels, _, _ in tqdm(dataLoader, desc="Validating", leave=False):
                 images = images.cuda()
                 task_labels = task_labels.cuda(non_blocking=True)
-                
+
                 features = self.model(images)
                 task_output = self.model.module.get_task_predictions(features)
 
                 losstensor = self.loss_task(task_output, task_labels)
                 lossVal += losstensor.item()
                 lossValNorm += 1
-                
+
                 y_true.append(task_labels.cpu())
                 y_pred.append(torch.sigmoid(task_output).cpu())
-        
+
         y_true = torch.cat(y_true, 0)
         y_pred = torch.cat(y_pred, 0)
-        
+
         return lossVal / lossValNorm, y_true, y_pred
 
     def _compute_auroc(self, dataGT, dataPRED, classCount):
         scores = []
         npGT = dataGT.cpu().numpy()
         npPRED = dataPRED.cpu().numpy()
-        
+
         for i in range(classCount):
             try:
                 scores.append(roc_auc_score(npGT[:, i], npPRED[:, i]))
             except:
                 scores.append(float('nan'))
-        
+
         return np.array(scores)
 
     def _compute_f1(self, dataGT, dataPRED, threshold=0.5):
@@ -263,27 +303,38 @@ class CheXpertTrainer:
         if checkpoint is not None:
             modelCheckpoint = torch.load(checkpoint, weights_only=False)
             self.model.load_state_dict(modelCheckpoint['state_dict'])
-        
+
         self.model.eval()
         outGT = torch.FloatTensor().cuda()
         outPRED = torch.FloatTensor().cuda()
-        
+
         with torch.no_grad():
             for images, task_labels, _, paths in dataLoaderTest:
                 task_labels = task_labels.cuda()
                 outGT = torch.cat((outGT, task_labels), 0)
-                
+
                 images = images.cuda()
                 features = self.model(images)
                 task_out = self.model.module.get_task_predictions(features)
                 task_out = torch.sigmoid(task_out)
                 outPRED = torch.cat((outPRED, task_out), 0)
-        
+
         aurocIndividual = self._compute_auroc(outGT, outPRED, nnClassCount)
         aurocMean = np.nanmean(aurocIndividual)
-        
-        print('\n📊 AUROC mean:', aurocMean)
+
+        self.logger.info(f'📊 AUROC mean: {aurocMean:.4f}')
         for i in range(len(aurocIndividual)):
-            print(f'{class_names[i]} : {aurocIndividual[i]:.4f}')
-        
+            self.logger.info(f'{class_names[i]} : {aurocIndividual[i]:.4f}')
+
         return outGT, outPRED
+
+    def setup_file_logging(self, log_file_path):
+        """Add file handler to logger for saving logs to file"""
+        file_handler = logging.FileHandler(log_file_path)
+        formatter = logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        file_handler.setFormatter(formatter)
+        self.logger.addHandler(file_handler)
+        self.logger.info(f"File logging enabled: {log_file_path}")
