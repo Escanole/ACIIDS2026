@@ -19,12 +19,12 @@ data:
   policy: "u-ones-lsr"
 
 paths:
-  train_csv: "/home/nguyentk/diancxr/dataset/versions/1/train.csv"
-  valid_csv: "/home/nguyentk/diancxr/dataset/versions/1/valid.csv"
-  test_csv: "/home/nguyentk/diancxr/dataset/versions/content/chexlocalize/chexlocalize/CheXpert/test_labels.csv"
-  train_base: "/home/nguyentk/diancxr/dataset/versions/1/"
-  valid_base: "/home/nguyentk/diancxr/dataset/versions/1/"
-  test_base: "/home/nguyentk/diancxr/dataset/versions/content/chexlocalize/chexlocalize/CheXpert/test"
+  train_csv: "C:/causal_xray/chexpert/train.csv" #Replace with your own path
+  valid_csv: "C:/causal_xray/chexpert/valid.csv" #Replace with your own path
+  test_csv: "C:/causal_xray/chexpert/test_labels.csv" #Replace with your own path
+  train_base: "C:/causal_xray/chexpert" #Replace with your own path
+  valid_base: "C:/causal_xray/chexpert" #Replace with your own path
+  test_base: "C:/causal_xray/chexpert" #Replace with your own path
 
 class_names:
   - "No Finding"
