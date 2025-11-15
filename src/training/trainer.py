@@ -163,7 +163,10 @@ class CheXpertTrainer:
 
         # Original focal loss approach — inverse frequency, unscaled
         alpha_values = N / pos_counts
-        alpha_tensor = torch.tensor(alpha_values, dtype=torch.float32)
+        min_a, max_a = alpha_values.min(), alpha_values.max()
+        scaled_alpha = 0.25 + 0.5 * (alpha_values - min_a) / (max_a - min_a)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        alpha_tensor = torch.tensor(scaled_alpha, dtype=torch.float32, device=device)  
 
         self.loss_task = FocalLoss(alpha=alpha_tensor, gamma=2, reduction='mean')
         self.loss_domain = nn.BCEWithLogitsLoss()
@@ -287,6 +290,7 @@ class CheXpertTrainer:
             aucs_dev.append(auroc_dev)
             aucs_nodev.append(auroc_nodev)
             f1s.append(f1)
+            val_losses.append(val_loss)
 
             # Save checkpoints
             checkpoint_state = {
@@ -440,7 +444,7 @@ class CheXpertTrainer:
             # Update progress
             if batchID % 35 == 0:
                 batchs.append(batchID)
-                val_loss, _, _ = self._validate_epoch(dataLoaderVal)
+                val_loss, _, _, _ = self._validate_epoch(dataLoaderVal)
                 losseval.append(val_loss)
                 postfix = {
                     'Total Loss': f"{total_loss.item():.4f}",
