@@ -7,13 +7,16 @@ model:
 training:
   batch_size: 64
   max_epochs: 15
+  attention_learning_rate: 0.001
   learning_rate: 0.0001
   weight_decay: 1e-5
+  factor: 0.005
+  strategy: 'task_entropy'
   
 data:
   image_size: 224
-  resize: [224, 224]
-  policy: "ones"
+  resize: [256, 256]
+  policy: "u-ones-lsr"
 
 paths:
   train_csv: "C:/causal_xray/chexpert/train.csv"

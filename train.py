@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 import numpy as np
 import argparse
+import random
 
 # Add src to path
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
@@ -15,6 +16,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 from src.data.dataset import CheXpertDataSet
 from src.models.architectures import DANN_DenseNet121
 from src.training.trainer import CheXpertTrainer
+from src.utils.visualization import plot_dann_losses, plot_metrics, plot_gradient_metrics
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train DANN Causal Chest X-Ray Model')
@@ -37,11 +39,33 @@ def create_transforms(config):
     normalize = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     transform_list = [
         transforms.Resize(config['data']['resize']),
-        transforms.RandomHorizontalFlip(),
+        transforms.CenterCrop(config['data']['image_size']),
         transforms.ToTensor(),
         normalize
     ]
     return transforms.Compose(transform_list)
+
+seed = 3 #np.random.randint(0, 10000)
+print("Currently using seed: ", seed)
+def set_seed(seed: int = seed):
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # if multi-GPU
+
+# call it
+set_seed(seed)
+
+# worker seed helper and generator for DataLoader
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+g = torch.Generator()
+g.manual_seed(seed)
 
 def setup_data_loaders(config, transform):
     print("Creating datasets...")
@@ -50,7 +74,7 @@ def setup_data_loaders(config, transform):
         image_list_file=config['paths']['train_csv'],
         base_path=config['paths']['train_base'],
         transform=transform,
-        policy=config['data']['policy']
+        policy=config['data']['policy'], a1=0.55, b1=0.85
     )
     
     val_dataset = CheXpertDataSet(
@@ -59,18 +83,12 @@ def setup_data_loaders(config, transform):
         transform=transform
     )
     
-    # For testing (optional)
-    test_dataset = CheXpertDataSet(
-        image_list_file=config['paths']['test_csv'],
-        base_path=config['paths']['test_base'],
-        transform=transform
-    )
-    
     train_loader = DataLoader(
         train_dataset,
         batch_size=config['training']['batch_size'],
         shuffle=True,
-        num_workers=4,
+        num_workers=4, 
+        worker_init_fn=seed_worker, generator=g,
         pin_memory=True
     )
     
@@ -78,68 +96,12 @@ def setup_data_loaders(config, transform):
         val_dataset,
         batch_size=config['training']['batch_size'],
         shuffle=False,
-        num_workers=4,
+        num_workers=4, 
+        worker_init_fn=seed_worker, generator=g,
         pin_memory=True
     )
     
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=config['training']['batch_size'],
-        shuffle=False,
-        num_workers=4,
-        pin_memory=True
-    )
-    
-    return train_loader, val_loader, test_loader
-
-def plot_results(total_losses, task_losses, domain_losses, val_losses, f1s, aucs):
-    """Plot training results"""
-    epochs = range(1, len(total_losses) + 1)
-    
-    # Plot losses
-    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
-    
-    # Loss components
-    ax1.plot(epochs, total_losses, 'r-', label='Total Loss')
-    ax1.plot(epochs, task_losses, 'b-', label='Task Loss')
-    ax1.plot(epochs, domain_losses, 'g-', label='Domain Loss')
-    ax1.plot(epochs, val_losses, 'orange', label='Val Loss')
-    ax1.set_xlabel('Epoch')
-    ax1.set_ylabel('Loss')
-    ax1.set_title('Training Losses')
-    ax1.legend()
-    ax1.grid(True)
-    
-    # Task vs Val loss
-    ax2.plot(epochs, task_losses, 'b-', label='Train Task Loss')
-    ax2.plot(epochs, val_losses, 'orange', label='Val Loss')
-    ax2.set_xlabel('Epoch')
-    ax2.set_ylabel('Loss')
-    ax2.set_title('Task Loss vs Validation Loss')
-    ax2.legend()
-    ax2.grid(True)
-    
-    # F1 Score
-    ax3.plot(epochs, f1s, 'g-', marker='o')
-    ax3.set_xlabel('Epoch')
-    ax3.set_ylabel('F1 Score')
-    ax3.set_title('F1 Score Evolution')
-    ax3.grid(True)
-    
-    # AUROC
-    if isinstance(aucs[0], np.ndarray):
-        mean_aucs = [np.nanmean(auc) for auc in aucs]
-        ax4.plot(epochs, mean_aucs, 'purple', marker='s')
-    else:
-        ax4.plot(epochs, aucs, 'purple', marker='s')
-    ax4.set_xlabel('Epoch')
-    ax4.set_ylabel('AUROC')
-    ax4.set_title('AUROC Evolution')
-    ax4.grid(True)
-    
-    plt.tight_layout()
-    plt.savefig('results/training_results.png', dpi=300, bbox_inches='tight')
-    plt.show()
+    return train_loader, val_loader
 
 def main():
     args = parse_args()
@@ -166,8 +128,8 @@ def main():
     
     # Setup data
     transform = create_transforms(config)
-    train_loader, val_loader, test_loader = setup_data_loaders(config, transform)
-    print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}, Test batches: {len(test_loader)}")
+    train_loader, val_loader = setup_data_loaders(config, transform)
+    print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
     
     # Setup model
     print("Initializing DANN model...")
@@ -187,52 +149,67 @@ def main():
     # Start training or testing
     timestamp = time.strftime("%d%m%Y-%H%M%S")
     
-    if args.test_only:
-        print(f"🧪 Testing model only...")
-        if args.checkpoint is None:
-            raise ValueError("--checkpoint is required when using --test-only")
+    print(f"Training started at {timestamp}")
+    
+    try:
+        total_losses, task_losses, domain_losses, val_losses, f1s, aucs, aucs_dev, aucs_nodev, all_grad_conflicts = trainer.train(
+            train_loader, 
+            val_loader,
+            config['training']['max_epochs'],
+            timestamp,
+            checkpoint=args.checkpoint
+        )
         
-        trainer.test(test_loader, config['model']['num_classes'], 
-                    args.checkpoint, config['class_names'])
-    else:
-        print(f"Training started at {timestamp}")
+        print("\n" + "="*60)
+        print("🎉 Training completed successfully!")
+        print("=== DEBUGGING LOSS ARRAYS ===")
+        print(f"total_losses: {total_losses}")
+        print(f"task_losses: {task_losses}")
+        print(f"domain_losses: {domain_losses}")
+        print(f"val_losses: {val_losses}")
+        print(f"aucs_all: {aucs}")
+        print(f"aucs_dev: {aucs_dev}")
+        print(f"aucs_nodev: {aucs_nodev}")
+        print(f"all_grad_conflicts: {all_grad_conflicts}")
+
+        print(f"\nArray lengths:")
+        print(f"total_losses length: {len(total_losses)}")
+        print(f"task_losses length: {len(task_losses)}")
+        print(f"domain_losses length: {len(domain_losses)}")
+        print(f"val_losses length: {len(val_losses)}")
+
+        print(f"\nArray types:")
+        print(f"total_losses type: {type(total_losses)}, element type: {type(total_losses[0]) if total_losses else 'empty'}")
+        print(f"task_losses type: {type(task_losses)}, element type: {type(task_losses[0]) if task_losses else 'empty'}")
+
+        print(f"\nValue ranges:")
+        print(f"total_losses range: {min(total_losses) if total_losses else 'empty'} to {max(total_losses) if total_losses else 'empty'}")
+        print(f"task_losses range: {min(task_losses) if task_losses else 'empty'} to {max(task_losses) if task_losses else 'empty'}")
+        print(f"domain_losses range: {min(domain_losses) if domain_losses else 'empty'} to {max(domain_losses) if domain_losses else 'empty'}")
+        print(f"val_losses range: {min(val_losses) if val_losses else 'empty'} to {max(val_losses) if val_losses else 'empty'}")
+
+        # Check for any weird values
+        for i, (total, task, domain, val) in enumerate(zip(total_losses, task_losses, domain_losses, val_losses)):
+            if abs(total) > 10 or abs(task) > 10 or abs(domain) > 10 or abs(val) > 10:
+                print(f"⚠️  Epoch {i+1} has extreme values: total={total}, task={task}, domain={domain}, val={val}")
+            if np.isnan(total) or np.isnan(task) or np.isnan(domain) or np.isnan(val):
+                print(f"⚠️  Epoch {i+1} has NaN values: total={total}, task={task}, domain={domain}, val={val}")
+            if np.isinf(total) or np.isinf(task) or np.isinf(domain) or np.isinf(val):
+                print(f"⚠️  Epoch {i+1} has Inf values: total={total}, task={task}, domain={domain}, val={val}")
+        print("="*60)
         
-        try:
-            total_losses, task_losses, domain_losses, val_losses, f1s, aucs = trainer.train(
-                train_loader, 
-                val_loader,
-                config['training']['max_epochs'],
-                timestamp,
-                checkpoint=args.checkpoint
-            )
-            
-            print("\n" + "="*60)
-            print("🎉 Training completed successfully!")
-            print(f"Final Task Loss: {task_losses[-1]:.4f}")
-            print(f"Final Val Loss: {val_losses[-1]:.4f}")
-            print(f"Final F1 Score: {f1s[-1]:.4f}")
-            
-            if isinstance(aucs[-1], np.ndarray):
-                final_auc = np.nanmean(aucs[-1])
-                print(f"Final Mean AUROC: {final_auc:.4f}")
-            else:
-                print(f"Final AUROC: {aucs[-1]:.4f}")
-            print("="*60)
-            
-            # Plot results
-            plot_results(total_losses, task_losses, domain_losses, val_losses, f1s, aucs)
-            
-            # Optional: Test the model
-            # print("\n🧪 Testing model...")
-            # trainer.test(test_loader, config['model']['num_classes'],
-            #             f"models/checkpoints/best_auc/best_auc_epoch{len(aucs)-1}_{timestamp}.pth.tar",
-            #             config['class_names'])
-            
-        except KeyboardInterrupt:
-            print("\n⚠️ Training interrupted by user")
-        except Exception as e:
-            print(f"\n❌ Training failed: {str(e)}")
-            raise
+        # Plot results
+        plot_dann_losses(total_losses, task_losses, domain_losses, val_losses, per_epoch=True)
+        plot_metrics(f1s, aucs, name="ALL")
+        plot_metrics(f1s, aucs_dev, name="DEVICE")
+        plot_metrics(f1s, aucs_nodev, name="NO-DEVICE")
+        plot_gradient_metrics(all_grad_conflicts)
+        
+    except KeyboardInterrupt:
+        print("\n⚠️ Training interrupted by user")
+    except Exception as e:
+        print(f"\n❌ Training failed: {str(e)}")
+        raise
 
 if __name__ == "__main__":
     main()
