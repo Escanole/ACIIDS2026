@@ -7,21 +7,24 @@ model:
 training:
   batch_size: 64
   max_epochs: 15
-  learning_rate: 0.0001
+  attention_learning_rate: 1e-3
+  learning_rate: 1e-4
   weight_decay: 1e-5
+  factor: 0.005
+  strategy: 'task_entropy'
   
 data:
   image_size: 224
-  resize: [224, 224]
-  policy: "ones"
+  resize: [256, 256]
+  policy: "u-ones-lsr"
 
 paths:
-  train_csv: "C:/causal_xray/chexpert/train.csv"
-  valid_csv: "C:/causal_xray/chexpert/valid.csv"
-  test_csv: "C:/causal_xray/chexpert/test_labels.csv"
-  train_base: "C:/causal_xray/chexpert"
-  valid_base: "C:/causal_xray/chexpert"
-  test_base: "C:/causal_xray/chexpert"
+  train_csv: "/home/nguyentk/diancxr/dataset/versions/1/train.csv"
+  valid_csv: "/home/nguyentk/diancxr/dataset/versions/1/valid.csv"
+  test_csv: "/home/nguyentk/diancxr/dataset/versions/content/chexlocalize/chexlocalize/CheXpert/test_labels.csv"
+  train_base: "/home/nguyentk/diancxr/dataset/versions/1/"
+  valid_base: "/home/nguyentk/diancxr/dataset/versions/1/"
+  test_base: "/home/nguyentk/diancxr/dataset/versions/content/chexlocalize/chexlocalize/CheXpert/test"
 
 class_names:
   - "No Finding"

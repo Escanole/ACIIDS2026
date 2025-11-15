@@ -8,11 +8,112 @@ import logging
 from tqdm import tqdm
 from sklearn.metrics import f1_score, roc_auc_score
 from torch.optim.lr_scheduler import LambdaLR
+import pandas as pd
 
 def save_checkpoint(state, dir_path, filename):
     os.makedirs(dir_path, exist_ok=True)
     path = os.path.join(dir_path, filename)
     torch.save(state, path)
+
+def cosine_similarity(grads_a, grads_b): 
+    """
+    Calculate cosine similarity AND gradient magnitudes in one function
+    
+    Returns:
+        tuple: (cosine_similarity, magnitude_a, magnitude_b)
+    """
+    dot = sum([(ga*gb).sum() for ga, gb in zip(grads_a, grads_b)]) 
+    norm_a = torch.sqrt(sum([(ga**2).sum() for ga in grads_a])) 
+    norm_b = torch.sqrt(sum([(gb**2).sum() for gb in grads_b])) 
+    
+    cosine_sim = (dot / (norm_a*norm_b + 1e-8)).item()
+    magnitude_a = norm_a.item()
+    magnitude_b = norm_b.item()
+    
+    return cosine_sim, magnitude_a, magnitude_b
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2, reduction='mean'):
+        """
+        Focal Loss implementation for binary classification
+        
+        Args:
+            alpha (float): Weighting factor for positive class vs negative class
+                         - Common values: 0.25 (more weight to negatives) or 1.0 (balanced)
+                         - Can also be a tensor for per-class alpha values
+            gamma (float): Focusing parameter to down-weight easy examples (default: 2)
+            reduction (str): Specifies the reduction to apply to the output
+        """
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        self.bce = nn.BCEWithLogitsLoss(reduction='none')
+    
+    def forward(self, inputs, targets):
+        # Calculate BCE loss without pos_weight (focal loss handles imbalance)
+        bce_loss = self.bce(inputs, targets)
+        
+        # Apply sigmoid to get probabilities
+        p = torch.sigmoid(inputs)
+        
+        # Calculate p_t: probability of the true class
+        p_t = p * targets + (1 - p) * (1 - targets)
+        
+        # Calculate focal weight: (1-p_t)^gamma
+        focal_weight = (1 - p_t) ** self.gamma
+        
+        # Apply alpha weighting for class balance
+        alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+        focal_loss = alpha_t * focal_weight * bce_loss
+        
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+def lamdba_computing(model, dataLoaderVal, nnClassCount, factor, strategy, epoch, max_epoch):
+    def compute_lambda_entropy(model, dataLoaderVal, nnClassCount, factor):
+        model.eval()
+        eps = 1e-8
+        all_entropy = []
+    
+        with torch.no_grad():
+            for i, (images, _, _, _) in enumerate(dataLoaderVal):
+                if i >= 5:  # average over first 5 batches
+                    break
+                images = images.cuda(non_blocking=True)
+                features = model(images)
+                task_preds = model.module.get_task_predictions(features)
+                probs = torch.sigmoid(task_preds)
+    
+                # Compute per-class binary entropy
+                entropy = - (probs * torch.log(probs + eps) + (1 - probs) * torch.log(1 - probs + eps))
+                # Mean over classes for each sample, then mean over batch
+                entropy_batch_mean = entropy.mean(dim=1).mean().item()
+                all_entropy.append(entropy_batch_mean)
+    
+        entropy_mean = np.mean(all_entropy)
+        max_entropy = np.log(2)  # mean per class max entropy
+        lambda_dyn = (entropy_mean / (max_entropy + eps)) * factor
+    
+        model.train()
+        return lambda_dyn
+    
+    def compute_lambda_schedule(epoch, max_epoch, factor):
+        p = epoch / max_epoch
+        return factor*(2. / (1+np.exp(-10.*p)) - 1.)
+
+    if strategy == 'task_entropy':
+        lambda_dyn = compute_lambda_entropy(model, dataLoaderVal, nnClassCount, factor)
+    elif strategy == 'schedule':
+        lambda_dyn = compute_lambda_schedule(epoch, max_epoch, factor)
+    else:
+        print("Strategy is invalid!")
+
+    return lambda_dyn
 
 class CheXpertTrainer:
     def __init__(self, model, config):
@@ -34,17 +135,40 @@ class CheXpertTrainer:
         # Separate optimizers for DANN
         feature_params = list(model.module.features.parameters())
         task_params = list(model.module.task_classifier.parameters())
-        domain_params = list(model.module.domain_conv.parameters()) + list(model.module.domain_classifier.parameters())
+        domain_params = list(model.module.domain_classifier.parameters())  # No more domain_conv
+        shared_attention_params = list(model.module.shared_attention.parameters())  # New shared attention
         
         # Ensure weight_decay is float
+        att_lr = float(config['training']['attention_learning_rate'])
         lr = float(config['training']['learning_rate'])
         weight_decay = float(config['training']['weight_decay'])
         
+        self.SA_optimizer = optim.Adam(shared_attention_params, lr=att_lr, weight_decay=weight_decay)
         self.F_optimizer = optim.Adam(feature_params, lr=lr, weight_decay=weight_decay)
         self.C_optimizer = optim.Adam(task_params, lr=lr, weight_decay=weight_decay)
         self.D_optimizer = optim.Adam(domain_params, lr=lr, weight_decay=weight_decay)
         
-        self.loss_task = nn.BCEWithLogitsLoss()
+        train_csv = config['paths']['train_csv']
+        df = pd.read_csv(train_csv)
+
+        label_cols = config['class_names'][:-1]  # exclude Support Devices
+        df[label_cols] = df[label_cols].replace(-1, 1).fillna(0)
+
+        labels_np = df[label_cols].values.astype(np.float32)
+        binary_labels_np = (labels_np >= 0.5).astype(np.float32)
+        task_labels_np = binary_labels_np[:, :config['model']['num_classes']]
+
+        pos_counts = task_labels_np.sum(axis=0)
+        N = task_labels_np.shape[0]
+
+        # Original focal loss approach — inverse frequency, unscaled
+        alpha_values = N / pos_counts
+        min_a, max_a = alpha_values.min(), alpha_values.max()
+        scaled_alpha = 0.25 + 0.5 * (alpha_values - min_a) / (max_a - min_a)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        alpha_tensor = torch.tensor(scaled_alpha, dtype=torch.float32, device=device)  
+
+        self.loss_task = FocalLoss(alpha=alpha_tensor, gamma=2, reduction='mean')
         self.loss_domain = nn.BCEWithLogitsLoss()
 
     def train(self, dataLoaderTrain, dataLoaderVal, trMaxEpoch, launchTimestamp, checkpoint=None):
@@ -58,6 +182,9 @@ class CheXpertTrainer:
         val_losses = []
         f1s = []
         aucs = []
+        aucs_dev = []
+        aucs_nodev = []
+        all_grad_conflicts = []
 
         # === Epoch control logic ===
         total_epochs = trMaxEpoch  # used for correct lambda schedule
@@ -70,6 +197,7 @@ class CheXpertTrainer:
             self.F_optimizer.load_state_dict(modelCheckpoint.get('F_optimizer', {}))
             self.C_optimizer.load_state_dict(modelCheckpoint.get('C_optimizer', {}))
             self.D_optimizer.load_state_dict(modelCheckpoint.get('D_optimizer', {}))
+            self.SA_optimizer.load_state_dict(modelCheckpoint.get('SA_optimizer', {}))
             start_epoch = modelCheckpoint.get('epoch', 0)
             lossMIN = modelCheckpoint.get('val_loss', float('inf'))
             aucMAX = modelCheckpoint.get('mean_auc', float('-inf'))
@@ -96,15 +224,19 @@ class CheXpertTrainer:
                 self.logger.info(f"No checkpoint. Running {trMaxEpoch} epochs.")
 
         # Learning rate schedulers
-        lr_lambda = lambda epoch: 1 / (1 + 5 * (epoch / run_epochs)) ** 0.5
-        F_scheduler = LambdaLR(self.F_optimizer, lr_lambda)
-        C_scheduler = LambdaLR(self.C_optimizer, lr_lambda)
-        D_scheduler = LambdaLR(self.D_optimizer, lr_lambda)
+        T_max = run_epochs  # number of epochs for one cosine cycle
+        eta_min = 1e-6      # minimum learning rate at the end of annealing
+        
+        F_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.F_optimizer, T_max=T_max, eta_min=eta_min)
+        C_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.C_optimizer, T_max=T_max, eta_min=eta_min)
+        D_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.D_optimizer, T_max=T_max, eta_min=eta_min)
+        SA_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.SA_optimizer, T_max=T_max, eta_min=eta_min)
 
         for epochID in range(run_epochs):
             current_epoch = start_epoch + epochID
             p = current_epoch / total_epochs
-            lambda_ = 0.1 * (2. / (1 + np.exp(-10. * p)) - 1.)
+            
+            lambda_ = lamdba_computing(self.model, dataLoaderVal, self.config['model']['num_classes'], self.config['training']['factor'], self.config['training']['strategy'], current_epoch, total_epochs)
 
             self.logger.info(
                 f"Epoch {current_epoch + 1}/{total_epochs} | λ: {lambda_:.3f} | LR: {self.F_optimizer.param_groups[0]['lr']:.6f}")
@@ -114,8 +246,6 @@ class CheXpertTrainer:
                 self.logger.info("Unfreezing backbone (DenseNet121 features) with reduced LR")
                 for param in self.model.module.features.parameters():
                     param.requires_grad = True
-                for param_group in self.F_optimizer.param_groups:
-                    param_group['lr'] = 1e-5
 
                 def freeze_bn(module):
                     if isinstance(module, nn.BatchNorm2d):
@@ -125,14 +255,29 @@ class CheXpertTrainer:
                 self.model.module.features.apply(freeze_bn)
 
             # Train epoch
-            total_loss, task_loss, domain_loss = self._train_epoch(
+            total_loss, task_loss, domain_loss, grad_conflicts_epoch = self._train_epoch(
                 dataLoaderTrain, dataLoaderVal, lambda_, total_epochs,
                 self.config['model']['num_classes'], current_epoch
             )
 
             # Validation epoch
-            val_loss, y_true, y_pred = self._validate_epoch(dataLoaderVal)
-            auroc = self._compute_auroc(y_true, y_pred, self.config['model']['num_classes'])
+            val_loss, (y_true, y_pred), (y_true_dev, y_pred_dev), (y_true_nodev, y_pred_nodev) = self._validate_epoch(dataLoaderVal)
+            competition_indices = [2, 5, 6, 8, 10]
+            auroc = self._compute_auroc(y_true[:, competition_indices],
+                                        y_pred[:, competition_indices],
+                                        len(competition_indices))
+            
+            auroc_dev = self._compute_auroc(
+                                        y_true_dev[:, competition_indices],
+                                        y_pred_dev[:, competition_indices],
+                                        len(competition_indices)
+                                    ) if y_true_dev is not None else None
+            
+            auroc_nodev = self._compute_auroc(
+                                        y_true_nodev[:, competition_indices],
+                                        y_pred_nodev[:, competition_indices],
+                                        len(competition_indices)
+                                    ) if y_true_nodev is not None else None
             f1 = self._compute_f1(y_true, y_pred)
             mean_auc = np.nanmean(auroc)
 
@@ -140,9 +285,12 @@ class CheXpertTrainer:
             epoch_total_losses.append(total_loss)
             epoch_task_losses.append(task_loss)
             epoch_domain_losses.append(domain_loss)
-            val_losses.append(val_loss)
-            f1s.append(f1)
+            all_grad_conflicts.extend(grad_conflicts_epoch)
             aucs.append(auroc)
+            aucs_dev.append(auroc_dev)
+            aucs_nodev.append(auroc_nodev)
+            f1s.append(f1)
+            val_losses.append(val_loss)
 
             # Save checkpoints
             checkpoint_state = {
@@ -151,6 +299,7 @@ class CheXpertTrainer:
                 'F_optimizer': self.F_optimizer.state_dict(),
                 'C_optimizer': self.C_optimizer.state_dict(),
                 'D_optimizer': self.D_optimizer.state_dict(),
+                'SA_optimizer': self.SA_optimizer.state_dict(),
                 'val_loss': val_loss,
                 'mean_auc': mean_auc
             }
@@ -172,12 +321,27 @@ class CheXpertTrainer:
             self.logger.info(
                 f"SAVE - Epoch {current_epoch + 1} | 💾 Saved last checkpoint | Val Loss = {val_loss:.4f} | AUC Score = {mean_auc:.4f} | F1 Score = {f1:.4f}")
 
+            if epochID == 0:
+                best_auc = mean_auc
+                epochs_no_improve = 0
+            else:
+                if mean_auc > best_auc:
+                    best_auc = mean_auc
+                    epochs_no_improve = 0
+                else:
+                    epochs_no_improve += 1
+            
+            if epochs_no_improve >= 5:
+                self.logger.info(f"[EARLY STOP] No improvement in mean AUC for 5 consecutive epochs. Stopping at epoch {current_epoch+1}.")
+                break
+
             # Update schedulers
             F_scheduler.step()
             C_scheduler.step()
             D_scheduler.step()
+            SA_scheduler.step()
 
-        return epoch_total_losses, epoch_task_losses, epoch_domain_losses, val_losses, f1s, aucs
+        return epoch_total_losses, epoch_task_losses, epoch_domain_losses, val_losses, f1s, aucs, aucs_dev, aucs_nodev, all_grad_conflicts
 
     def _train_epoch(self, dataLoader, dataLoaderVal, lambda_, trMaxEpoch, nnClassCount, epochID):
         self.model.train()
@@ -185,6 +349,7 @@ class CheXpertTrainer:
         batchs = []
         losstrain_total, losstrain_task, losstrain_domain = [], [], []
         losseval = []
+        grad_conflicts = []
 
         progress = tqdm(enumerate(dataLoader), total=len(dataLoader), desc="Training")
         for batchID, (images, task_labels, domain_labels, _) in progress:
@@ -204,23 +369,57 @@ class CheXpertTrainer:
             # Step 2: Train Feature Extractor + Task Classifier
             features = self.model(images)
 
-            # Task loss (only on source domain - no support device)
-            source_mask = (domain_labels.squeeze() == 0)
-            if source_mask.sum() > 0:
-                task_preds = self.model.module.get_task_predictions(features[source_mask])
-                task_loss = self.loss_task(task_preds, task_labels[source_mask])
-            else:
-                task_loss = torch.tensor(0.0, requires_grad=True).cuda()
-
             # Domain loss for adversarial training
             domain_preds = self.model.module.get_domain_predictions(features)
             domain_loss_adv = self.loss_domain(domain_preds, domain_labels)
 
+            task_preds = self.model.module.get_task_predictions(features)
+            task_loss = self.loss_task(task_preds, task_labels)
+
             # Combined loss
             total_loss = task_loss - lambda_ * domain_loss_adv
 
+            # === Every 35 batches: compute gradient conflict (safely, before .backward()) ===
+            grad_cos = None
+            if batchID % 35 == 0:
+                try:
+                    # select only feature parameters that require grad
+                    features_params = [p for p in self.model.module.features.parameters() if p.requires_grad]
+                    if len(features_params) > 0:
+                        # compute grads via autograd.grad (does not write into .grad buffers)
+                        task_grads = torch.autograd.grad(
+                            task_loss,
+                            features_params,
+                            retain_graph=True,
+                            allow_unused=True
+                        )
+                        domain_grads = torch.autograd.grad(
+                            domain_loss_adv,
+                            features_params,
+                            retain_graph=True,
+                            allow_unused=True
+                        )
+    
+                        # filter out None entries
+                        task_grads = [g.detach() for g in task_grads if g is not None]
+                        domain_grads = [g.detach() for g in domain_grads if g is not None]
+                        domain_grads_adv = [ -lambda_ * g for g in domain_grads ]
+    
+                        if len(task_grads) > 0 and len(domain_grads) > 0:
+                            # compute cosine similarity safely
+                            grad_cos, task_magnitude, domain_magnitude = cosine_similarity(task_grads, domain_grads_adv)
+                        else:
+                            grad_cos, task_magnitude, domain_magnitude = None, None, None
+                    else:
+                        grad_cos, task_magnitude, domain_magnitude = None, None, None
+                except Exception as e:
+                    # don't crash training for analysis errors
+                    self.logger.info(f"[GradConflict] skipped at Epoch {epochID} Batch {batchID}: {e}")
+                    grad_cos, task_magnitude, domain_magnitude = None, None, None
+
             self.F_optimizer.zero_grad()
             self.C_optimizer.zero_grad()
+            self.SA_optimizer.zero_grad()
             total_loss.backward()
 
             # Check for NaN gradients
@@ -233,6 +432,7 @@ class CheXpertTrainer:
             if not has_nan:
                 self.F_optimizer.step()
                 self.C_optimizer.step()
+                self.SA_optimizer.step()
             else:
                 self.logger.warning("NaN gradients detected, skipping step")
 
@@ -244,43 +444,74 @@ class CheXpertTrainer:
             # Update progress
             if batchID % 35 == 0:
                 batchs.append(batchID)
-                val_loss, _, _ = self._validate_epoch(dataLoaderVal)
+                val_loss, _, _, _ = self._validate_epoch(dataLoaderVal)
                 losseval.append(val_loss)
-                progress.set_postfix({
+                postfix = {
                     'Total Loss': f"{total_loss.item():.4f}",
                     'Task Loss': f"{task_loss.item():.4f}",
                     'Domain Loss': f"{domain_loss.item():.4f}",
                     'Domain Adv': f"{domain_loss_adv.item():.4f}",
                     'Val Loss': f"{val_loss:.4f}"
-                })
+                }
+                if grad_cos is not None and task_magnitude is not None and domain_magnitude is not None:
+                    grad_conflicts.append((epochID, batchID, grad_cos, task_magnitude, domain_magnitude))
+    
+                progress.set_postfix(postfix)
+    
 
-        return (np.mean(losstrain_total), np.mean(losstrain_task), np.mean(losstrain_domain),)
+        return (np.mean(losstrain_total), np.mean(losstrain_task), np.mean(losstrain_domain), grad_conflicts)
 
     def _validate_epoch(self, dataLoader):
         self.model.eval()
         lossVal, lossValNorm = 0, 0
-        y_true = []
-        y_pred = []
+        y_true, y_pred = [], []
+        y_true_devices, y_pred_devices = [], []
+        y_true_no_devices, y_pred_no_devices = [], []
 
         with torch.no_grad():
-            for images, task_labels, _, _ in tqdm(dataLoader, desc="Validating", leave=False):
-                images = images.cuda()
-                task_labels = task_labels.cuda(non_blocking=True)
-
-                features = self.model(images)
-                task_output = self.model.module.get_task_predictions(features)
-
-                losstensor = self.loss_task(task_output, task_labels)
+            for varInput, task_target, domain_labels, _ in tqdm(dataLoader, desc="Validating", leave=False):
+                varInput = varInput.cuda()
+                varTarget = task_target.cuda(non_blocking=True)
+                domain_labels = domain_labels.cuda(non_blocking=True)
+    
+                # Only use task classifier for validation
+                features = self.model(varInput)
+                varTaskOutput = self.model.module.get_task_predictions(features)
+    
+                losstensor = self.loss_task(varTaskOutput, varTarget)
                 lossVal += losstensor.item()
                 lossValNorm += 1
+    
+                y_true.append(varTarget.cpu())
+                y_pred.append(torch.sigmoid(varTaskOutput).cpu())  # Apply sigmoid for BCEWithLogitsLoss
 
-                y_true.append(task_labels.cpu())
-                y_pred.append(torch.sigmoid(task_output).cpu())
+                mask_devices = (domain_labels.squeeze() == 1)
+                mask_no_devices = (domain_labels.squeeze() == 0)
+                
+                if mask_devices.any():
+                    y_true_devices.append(varTarget[mask_devices].cpu())
+                    y_pred_devices.append(torch.sigmoid(varTaskOutput[mask_devices]).cpu())
+                
+                if mask_no_devices.any():
+                    y_true_no_devices.append(varTarget[mask_no_devices].cpu())
+                    y_pred_no_devices.append(torch.sigmoid(varTaskOutput[mask_no_devices]).cpu())
+    
 
-        y_true = torch.cat(y_true, 0)
-        y_pred = torch.cat(y_pred, 0)
+        def finalize_metrics(y_true_list, y_pred_list):
+            if len(y_true_list) == 0:
+                return None, None
+            y_true = torch.cat(y_true_list, 0)
+            y_pred = torch.cat(y_pred_list, 0)
+            return y_true, y_pred
+        
+        y_true, y_pred = finalize_metrics(y_true, y_pred)
+        y_true_devices, y_pred_devices = finalize_metrics(y_true_devices, y_pred_devices)
+        y_true_no_devices, y_pred_no_devices = finalize_metrics(y_true_no_devices, y_pred_no_devices)
 
-        return lossVal / lossValNorm, y_true, y_pred
+        return (lossVal / lossValNorm, 
+                (y_true, y_pred),
+                (y_true_devices, y_pred_devices),
+                (y_true_no_devices, y_pred_no_devices))
 
     def _compute_auroc(self, dataGT, dataPRED, classCount):
         scores = []
@@ -298,35 +529,6 @@ class CheXpertTrainer:
     def _compute_f1(self, dataGT, dataPRED, threshold=0.5):
         preds = (dataPRED > threshold).float()
         return f1_score(dataGT.numpy(), preds.numpy(), average='macro')
-
-    def test(self, dataLoaderTest, nnClassCount, checkpoint, class_names):
-        if checkpoint is not None:
-            modelCheckpoint = torch.load(checkpoint, weights_only=False)
-            self.model.load_state_dict(modelCheckpoint['state_dict'])
-
-        self.model.eval()
-        outGT = torch.FloatTensor().cuda()
-        outPRED = torch.FloatTensor().cuda()
-
-        with torch.no_grad():
-            for images, task_labels, _, paths in dataLoaderTest:
-                task_labels = task_labels.cuda()
-                outGT = torch.cat((outGT, task_labels), 0)
-
-                images = images.cuda()
-                features = self.model(images)
-                task_out = self.model.module.get_task_predictions(features)
-                task_out = torch.sigmoid(task_out)
-                outPRED = torch.cat((outPRED, task_out), 0)
-
-        aurocIndividual = self._compute_auroc(outGT, outPRED, nnClassCount)
-        aurocMean = np.nanmean(aurocIndividual)
-
-        self.logger.info(f'📊 AUROC mean: {aurocMean:.4f}')
-        for i in range(len(aurocIndividual)):
-            self.logger.info(f'{class_names[i]} : {aurocIndividual[i]:.4f}')
-
-        return outGT, outPRED
 
     def setup_file_logging(self, log_file_path):
         """Add file handler to logger for saving logs to file"""

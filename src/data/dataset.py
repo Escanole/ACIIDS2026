@@ -3,9 +3,10 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 from PIL import Image
+import numpy as np
 
 class CheXpertDataSet(Dataset):
-    def __init__(self, image_list_file, base_path, transform=None, policy="ones"):
+    def __init__(self, image_list_file, base_path, transform=None, policy="ones", a0=0.05, b0=0.15, a1=0.85, b1=0.95):
         """
         image_list_file: path to CSV file (train/val/test)
         base_path: root folder where `train/`, `valid/`, `test/` folders exist
@@ -19,16 +20,39 @@ class CheXpertDataSet(Dataset):
             "Pneumothorax", "Pleural Effusion", "Pleural Other", "Fracture", "Support Devices"
         ]
 
-        # Handle uncertain labels
-        if policy == "ones":
-            df[self.label_columns] = df[self.label_columns].replace(-1, 1)
-        elif policy == "zeroes":
-            df[self.label_columns] = df[self.label_columns].replace(-1, 0)
-        df[self.label_columns] = df[self.label_columns].fillna(0)
+        # --- Separate device column before applying uncertainty policy ---
+        device_col = "Support Devices"
+        device_labels = df[device_col].fillna(0)       # NaN → 0 (no device)
+        device_labels = device_labels.replace(-1, 1)   # treat -1 as device present
+        device_labels = (device_labels > 0).astype(float)  # force binary {0,1}
 
-        # Store relative paths and labels
+        # Apply policy ONLY to disease labels
+        disease_cols = [c for c in self.label_columns if c != device_col]
+
+        if policy == "ones":
+            df[disease_cols] = df[disease_cols].replace(-1, 1)
+        elif policy == "zeroes":
+            df[disease_cols] = df[disease_cols].replace(-1, 0)
+        elif policy == "u-ones-lsr":
+            df[disease_cols] = df[disease_cols].applymap(
+                lambda x: np.random.uniform(a1, b1) if x == -1 else x
+            )
+        elif policy == "u-zeros-lsr":
+            df[disease_cols] = df[disease_cols].applymap(
+                lambda x: np.random.uniform(a0, b0) if x == -1 else x
+            )
+        else:
+            raise ValueError(f"Unknown policy: {policy}")
+
+        df[disease_cols] = df[disease_cols].fillna(0)
+
+        # Reattach the clean binary device column
+        df[device_col] = device_labels
+
+        # Store paths + labels
         self.image_names = df['Path'].tolist()
         self.labels = df[self.label_columns].astype(float).values.tolist()
+
         self.transform = transform
 
     def __getitem__(self, index):
