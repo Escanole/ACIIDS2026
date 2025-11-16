@@ -24,7 +24,7 @@ pip install -r requirements.txt
 
 - `--config`: Path to YAML config file (default: `config/model_config.yaml`)
 - `--checkpoint`: Path to checkpoint file to resume training from
-- 
+  
 ### Basic Training
 ```bash
 python train.py
