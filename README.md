@@ -35,6 +35,10 @@ python train.py
 python train.py --config config/model_config.yaml --checkpoint models/checkpoints/last/last_epoch5_12345678-123456.pth.tar
 ```
 
+### Testing
+```bash
+python train.py --test --checkpoint models/checkpoints/last/last_epoch5_12345678-123456.pth.tar
+```
 ## Output
 
 - Model checkpoints saved to `models/checkpoints/`

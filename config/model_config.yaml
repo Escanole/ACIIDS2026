@@ -11,7 +11,7 @@ training:
   learning_rate: 1e-4
   weight_decay: 1e-5
   factor: 0.005
-  strategy: 'task_entropy'
+  strategy: 'task_entropy' #or 'schedule'
   
 data:
   image_size: 224
@@ -19,12 +19,12 @@ data:
   policy: "u-ones-lsr"
 
 paths:
-  train_csv: "C:/causal_xray/chexpert/train.csv" #Replace with your own path
-  valid_csv: "C:/causal_xray/chexpert/valid.csv" #Replace with your own path
-  test_csv: "C:/causal_xray/chexpert/test_labels.csv" #Replace with your own path
-  train_base: "C:/causal_xray/chexpert" #Replace with your own path
-  valid_base: "C:/causal_xray/chexpert" #Replace with your own path
-  test_base: "C:/causal_xray/chexpert" #Replace with your own path
+  train_csv: "/home/nguyentk/diancxr/dataset/versions/1/train.csv" #Replace with your own path
+  valid_csv: "/home/nguyentk/diancxr/dataset/versions/1/valid.csv" #Replace with your own path
+  test_csv: "/home/nguyentk/diancxr/dataset/chestxpert-testset/content/chexlocalize/chexlocalize/CheXpert/test_labels.csv" #Replace with your own path
+  train_base: "/home/nguyentk/diancxr/dataset/versions/1" #Replace with your own path
+  valid_base: "/home/nguyentk/diancxr/dataset/versions/1" #Replace with your own path
+  test_base: "/home/nguyentk/diancxr/dataset/chestxpert-testset/content/chexlocalize/chexlocalize/CheXpert" #Replace with your own path
 
 class_names:
   - "No Finding"

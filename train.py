@@ -24,7 +24,7 @@ def parse_args():
                        help='Path to config file (default: config/model_config.yaml)')
     parser.add_argument('--checkpoint', type=str, default=None,
                        help='Path to checkpoint to resume training from')
-    parser.add_argument('--test-only', action='store_true',
+    parser.add_argument('--test', action='store_true',
                        help='Only run testing, skip training')
     return parser.parse_args()
 
@@ -82,6 +82,12 @@ def setup_data_loaders(config, transform):
         base_path=config['paths']['valid_base'],
         transform=transform
     )
+
+    test_dataset = CheXpertDataSet(
+        image_list_file=config['paths']['test_csv'],
+        base_path=config['paths']['test_base'],
+        transform=transform
+    )
     
     train_loader = DataLoader(
         train_dataset,
@@ -100,8 +106,14 @@ def setup_data_loaders(config, transform):
         worker_init_fn=seed_worker, generator=g,
         pin_memory=True
     )
+
+    test_loader = DataLoader(
+        test_dataset,
+        num_workers=4, 
+        pin_memory=True
+    )
     
-    return train_loader, val_loader
+    return train_loader, val_loader, test_loader
 
 def main():
     args = parse_args()
@@ -128,7 +140,7 @@ def main():
     
     # Setup data
     transform = create_transforms(config)
-    train_loader, val_loader = setup_data_loaders(config, transform)
+    train_loader, val_loader, test_loader = setup_data_loaders(config, transform)
     print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
     
     # Setup model
@@ -149,67 +161,75 @@ def main():
     # Start training or testing
     timestamp = time.strftime("%d%m%Y-%H%M%S")
     
-    print(f"Training started at {timestamp}")
+    if args.test:
+        print(f"🧪 Testing model only...")
+        if args.checkpoint is None:
+            raise ValueError("--checkpoint is required when using --test-only")
+        
+        trainer.test(test_loader, config['model']['num_classes'], 
+                    args.checkpoint, config['class_names'])
+    else:
+        print(f"Training started at {timestamp}")
     
-    try:
-        total_losses, task_losses, domain_losses, val_losses, f1s, aucs, aucs_dev, aucs_nodev, all_grad_conflicts = trainer.train(
-            train_loader, 
-            val_loader,
-            config['training']['max_epochs'],
-            timestamp,
-            checkpoint=args.checkpoint
-        )
-        
-        print("\n" + "="*60)
-        print("🎉 Training completed successfully!")
-        print("=== DEBUGGING LOSS ARRAYS ===")
-        print(f"total_losses: {total_losses}")
-        print(f"task_losses: {task_losses}")
-        print(f"domain_losses: {domain_losses}")
-        print(f"val_losses: {val_losses}")
-        print(f"aucs_all: {aucs}")
-        print(f"aucs_dev: {aucs_dev}")
-        print(f"aucs_nodev: {aucs_nodev}")
-        print(f"all_grad_conflicts: {all_grad_conflicts}")
+        try:
+            total_losses, task_losses, domain_losses, val_losses, f1s, aucs, aucs_dev, aucs_nodev, all_grad_conflicts = trainer.train(
+                train_loader, 
+                val_loader,
+                config['training']['max_epochs'],
+                timestamp,
+                checkpoint=args.checkpoint
+            )
+            
+            print("\n" + "="*60)
+            print("🎉 Training completed successfully!")
+            print("=== DEBUGGING LOSS ARRAYS ===")
+            print(f"total_losses: {total_losses}")
+            print(f"task_losses: {task_losses}")
+            print(f"domain_losses: {domain_losses}")
+            print(f"val_losses: {val_losses}")
+            print(f"aucs_all: {aucs}")
+            print(f"aucs_dev: {aucs_dev}")
+            print(f"aucs_nodev: {aucs_nodev}")
+            print(f"all_grad_conflicts: {all_grad_conflicts}")
 
-        print(f"\nArray lengths:")
-        print(f"total_losses length: {len(total_losses)}")
-        print(f"task_losses length: {len(task_losses)}")
-        print(f"domain_losses length: {len(domain_losses)}")
-        print(f"val_losses length: {len(val_losses)}")
+            print(f"\nArray lengths:")
+            print(f"total_losses length: {len(total_losses)}")
+            print(f"task_losses length: {len(task_losses)}")
+            print(f"domain_losses length: {len(domain_losses)}")
+            print(f"val_losses length: {len(val_losses)}")
 
-        print(f"\nArray types:")
-        print(f"total_losses type: {type(total_losses)}, element type: {type(total_losses[0]) if total_losses else 'empty'}")
-        print(f"task_losses type: {type(task_losses)}, element type: {type(task_losses[0]) if task_losses else 'empty'}")
+            print(f"\nArray types:")
+            print(f"total_losses type: {type(total_losses)}, element type: {type(total_losses[0]) if total_losses else 'empty'}")
+            print(f"task_losses type: {type(task_losses)}, element type: {type(task_losses[0]) if task_losses else 'empty'}")
 
-        print(f"\nValue ranges:")
-        print(f"total_losses range: {min(total_losses) if total_losses else 'empty'} to {max(total_losses) if total_losses else 'empty'}")
-        print(f"task_losses range: {min(task_losses) if task_losses else 'empty'} to {max(task_losses) if task_losses else 'empty'}")
-        print(f"domain_losses range: {min(domain_losses) if domain_losses else 'empty'} to {max(domain_losses) if domain_losses else 'empty'}")
-        print(f"val_losses range: {min(val_losses) if val_losses else 'empty'} to {max(val_losses) if val_losses else 'empty'}")
+            print(f"\nValue ranges:")
+            print(f"total_losses range: {min(total_losses) if total_losses else 'empty'} to {max(total_losses) if total_losses else 'empty'}")
+            print(f"task_losses range: {min(task_losses) if task_losses else 'empty'} to {max(task_losses) if task_losses else 'empty'}")
+            print(f"domain_losses range: {min(domain_losses) if domain_losses else 'empty'} to {max(domain_losses) if domain_losses else 'empty'}")
+            print(f"val_losses range: {min(val_losses) if val_losses else 'empty'} to {max(val_losses) if val_losses else 'empty'}")
 
-        # Check for any weird values
-        for i, (total, task, domain, val) in enumerate(zip(total_losses, task_losses, domain_losses, val_losses)):
-            if abs(total) > 10 or abs(task) > 10 or abs(domain) > 10 or abs(val) > 10:
-                print(f"⚠️  Epoch {i+1} has extreme values: total={total}, task={task}, domain={domain}, val={val}")
-            if np.isnan(total) or np.isnan(task) or np.isnan(domain) or np.isnan(val):
-                print(f"⚠️  Epoch {i+1} has NaN values: total={total}, task={task}, domain={domain}, val={val}")
-            if np.isinf(total) or np.isinf(task) or np.isinf(domain) or np.isinf(val):
-                print(f"⚠️  Epoch {i+1} has Inf values: total={total}, task={task}, domain={domain}, val={val}")
-        print("="*60)
-        
-        # Plot results
-        plot_dann_losses(total_losses, task_losses, domain_losses, val_losses, per_epoch=True)
-        plot_metrics(f1s, aucs, name="ALL")
-        plot_metrics(f1s, aucs_dev, name="DEVICE")
-        plot_metrics(f1s, aucs_nodev, name="NO-DEVICE")
-        plot_gradient_metrics(all_grad_conflicts)
-        
-    except KeyboardInterrupt:
-        print("\n⚠️ Training interrupted by user")
-    except Exception as e:
-        print(f"\n❌ Training failed: {str(e)}")
-        raise
+            # Check for any weird values
+            for i, (total, task, domain, val) in enumerate(zip(total_losses, task_losses, domain_losses, val_losses)):
+                if abs(total) > 10 or abs(task) > 10 or abs(domain) > 10 or abs(val) > 10:
+                    print(f"⚠️  Epoch {i+1} has extreme values: total={total}, task={task}, domain={domain}, val={val}")
+                if np.isnan(total) or np.isnan(task) or np.isnan(domain) or np.isnan(val):
+                    print(f"⚠️  Epoch {i+1} has NaN values: total={total}, task={task}, domain={domain}, val={val}")
+                if np.isinf(total) or np.isinf(task) or np.isinf(domain) or np.isinf(val):
+                    print(f"⚠️  Epoch {i+1} has Inf values: total={total}, task={task}, domain={domain}, val={val}")
+            print("="*60)
+            
+            # Plot results
+            plot_dann_losses(total_losses, task_losses, domain_losses, val_losses, per_epoch=True)
+            plot_metrics(f1s, aucs, name="ALL")
+            plot_metrics(f1s, aucs_dev, name="DEVICE")
+            plot_metrics(f1s, aucs_nodev, name="NO-DEVICE")
+            plot_gradient_metrics(all_grad_conflicts)
+            
+        except KeyboardInterrupt:
+            print("\n⚠️ Training interrupted by user")
+        except Exception as e:
+            print(f"\n❌ Training failed: {str(e)}")
+            raise
 
 if __name__ == "__main__":
     main()

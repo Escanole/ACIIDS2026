@@ -6,9 +6,10 @@ import time
 import os
 import logging
 from tqdm import tqdm
-from sklearn.metrics import f1_score, roc_auc_score
 from torch.optim.lr_scheduler import LambdaLR
 import pandas as pd
+import torch.backends.cudnn as cudnn
+from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score, accuracy_score
 
 def save_checkpoint(state, dir_path, filename):
     os.makedirs(dir_path, exist_ok=True)
@@ -512,6 +513,124 @@ class CheXpertTrainer:
                 (y_true, y_pred),
                 (y_true_devices, y_pred_devices),
                 (y_true_no_devices, y_pred_no_devices))
+    
+    def test(self, dataLoaderTest, nnClassCount, checkpoint, class_names, use_gpu=True):
+        cudnn.benchmark = True
+
+        # === Load model checkpoint ===
+        if checkpoint is not None:
+            ckpt = torch.load(checkpoint, weights_only=False)
+            self.model.load_state_dict(ckpt['state_dict'])
+
+        if use_gpu:
+            self.model = self.model.cuda()
+            outGT = torch.FloatTensor().cuda()
+            outPRED = torch.FloatTensor().cuda()
+            outDomainGT = torch.LongTensor().cuda()
+            outDomainPred = torch.LongTensor().cuda()
+        else:
+            self.model = self.model.cpu()
+            outGT = torch.FloatTensor()
+            outPRED = torch.FloatTensor()
+            outDomainGT = torch.LongTensor()
+            outDomainPred = torch.LongTensor()
+
+        self.model.eval()
+
+        # === Forward pass ===
+        with torch.no_grad():
+            for input, target, domain_labels, _ in dataLoaderTest:
+                target = target.cuda() if use_gpu else target
+                domain_labels = domain_labels.cuda() if use_gpu else domain_labels
+
+                outGT = torch.cat((outGT, target), 0)
+                outDomainGT = torch.cat((outDomainGT, domain_labels), 0)
+
+                varInput = input.cuda() if use_gpu else input
+                features = self.model(varInput)
+
+                # Task head
+                task_out = self.model.module.get_task_predictions(features)
+                task_out = torch.sigmoid(task_out)
+                outPRED = torch.cat((outPRED, task_out), 0)
+
+                # Domain head
+                domain_out = self.model.module.get_domain_predictions(features)
+                domain_pred = (torch.sigmoid(domain_out) > 0.5).long().view(-1)
+                outDomainPred = torch.cat((outDomainPred, domain_pred), 0)
+
+        # === AUROC metrics ===
+        aurocIndividual = self._compute_auroc(outGT, outPRED, nnClassCount)
+        aurocMean = np.nanmean(aurocIndividual)
+
+        domain_acc = accuracy_score(outDomainGT.cpu().numpy(), outDomainPred.cpu().numpy())
+
+        self.logger.info(f"\nAUROC mean: {aurocMean:.4f}")
+        self.logger.info(f"Domain head accuracy (device presence): {domain_acc:.4f}")
+
+        for i in range(len(aurocIndividual)):
+            self.logger.info(f"{class_names[i]} : {aurocIndividual[i]:.4f}")
+
+        # === CheXpert 5-class analysis ===
+        chexpert5 = ['Cardiomegaly', 'Edema', 'Consolidation', 'Atelectasis', 'Pleural Effusion']
+        label_to_index = {name: idx for idx, name in enumerate(class_names)}
+        indices5 = [label_to_index[lbl] for lbl in chexpert5]
+
+        (best_f1, best_thresh,
+        best_prec, best_rec,
+        best_f1_pc, best_prec_pc, best_rec_pc) = self._find_best_f1(outGT, outPRED, focus_indices=indices5)
+
+        self.logger.info(f"\nBest threshold F1 (5-class): {best_f1:.4f} at threshold={best_thresh:.3f}")
+        for i, idx in enumerate(indices5):
+            self.logger.info(f"{class_names[idx]}: F1={best_f1_pc[i]:.4f}, "
+                            f"Precision={best_prec_pc[i]:.4f}, Recall={best_rec_pc[i]:.4f}")
+
+        chexpert5_aucs = [aurocIndividual[i] for i in indices5]
+        mean5 = np.nanmean(chexpert5_aucs)
+
+        self.logger.info("\nCheXpert 5-class AUROC:")
+        for i in indices5:
+            self.logger.info(f"{class_names[i]}: {aurocIndividual[i]:.4f}")
+        self.logger.info(f"Mean AUROC (5-class): {mean5:.4f}")
+
+        return outGT, outPRED, outDomainGT, outDomainPred, aurocIndividual
+    
+    def _find_best_f1(self, dataGT, dataPRED, num_thresholds=1000, focus_indices=None):
+        thresholds = np.linspace(0, 1, num_thresholds)
+        best_f1 = -1
+        best_thresh = None
+        best_precision = None
+        best_recall = None
+        best_f1_per_class = None
+        best_precision_per_class = None
+        best_recall_per_class = None
+    
+        y_true = dataGT.cpu().numpy()
+        y_scores = dataPRED.cpu().numpy()
+    
+        # If focus_indices provided, filter GT and predictions
+        if focus_indices is not None:
+            y_true = y_true[:, focus_indices]
+            y_scores = y_scores[:, focus_indices]
+    
+        for t in thresholds:
+            preds = (y_scores > t).astype(int)
+            f1 = f1_score(y_true, preds, average='macro', zero_division=0)
+    
+            if f1 > best_f1:
+                best_f1 = f1
+                best_thresh = t
+                # Macro
+                best_precision = precision_score(y_true, preds, average='macro', zero_division=0)
+                best_recall = recall_score(y_true, preds, average='macro', zero_division=0)
+                # Per-class
+                best_f1_per_class = f1_score(y_true, preds, average=None, zero_division=0)
+                best_precision_per_class = precision_score(y_true, preds, average=None, zero_division=0)
+                best_recall_per_class = recall_score(y_true, preds, average=None, zero_division=0)
+    
+        return (best_f1, best_thresh,
+                best_precision, best_recall,
+                best_f1_per_class, best_precision_per_class, best_recall_per_class)
 
     def _compute_auroc(self, dataGT, dataPRED, classCount):
         scores = []
